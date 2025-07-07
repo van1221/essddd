@@ -1,0 +1,217 @@
+// server.js (Simplified)
+const express = require('express');
+const bodyParser = require('body-parser');
+const jwt = require('jsonwebtoken'); // For authentication
+const bcrypt = require('bcryptjs'); // For password hashing
+const { Pool } = require('pg'); // For PostgreSQL
+const WebSocket = require('ws'); // For real-time updates
+const http = require('http'); // For WebSocket server
+
+const app = express();
+const server = http.createServer(app); // Create HTTP server for WebSocket
+const wss = new WebSocket.Server({ server }); // WebSocket server
+
+const pool = new Pool({
+    user: 'your_user',
+    host: 'your_host',
+    database: 'your_database',
+    password: 'your_password',
+    port: 5432,
+});
+
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+
+// Middleware for JWT authentication
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (token == null) return res.sendStatus(401);
+
+    jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, user) => {
+        if (err) return res.sendStatus(403);
+        req.user = user;
+        next();
+    });
+};
+
+// --- User Authentication ---
+app.post('/register', async (req, res) => {
+    try {
+        const { username, email, password } = req.body;
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const result = await pool.query(
+            'INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email',
+            [username, email, hashedPassword]
+        );
+        res.status(201).json({ message: 'User registered successfully', user: result.rows[0] });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error registering user' });
+    }
+});
+
+app.post('/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+        const user = result.rows[0];
+
+        if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+            return res.status(400).json({ message: 'Invalid credentials' });
+        }
+
+        const accessToken = jwt.sign({ id: user.id, email: user.email }, process.env.ACCESS_TOKEN_SECRET, { expiresIn: '1h' });
+        res.json({ accessToken });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error logging in' });
+    }
+});
+
+// --- Charging Station Availability (using a dummy data source or external API) ---
+const chargingStations = [
+    { id: 1, name: 'EcoCharge Hub', address: '123 Main St', latitude: 22.5726, longitude: 88.3639, power_kw: 50, connector_type: 'CCS', status: 'available' },
+    { id: 2, name: 'VoltCharge Point', address: '456 Park Ave', latitude: 22.5800, longitude: 88.3500, power_kw: 22, connector_type: 'Type 2', status: 'occupied' },
+    // ... more stations, ideally fetched from a real API
+];
+
+// Broadcast real-time availability updates
+const broadcastAvailability = () => {
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({ type: 'station_availability_update', stations: chargingStations }));
+        }
+    });
+};
+
+// Simulate real-time updates (in a real app, this would come from station hardware/APIs)
+setInterval(() => {
+    // Example: Toggle status of a station
+    const stationToUpdate = chargingStations.find(s => s.id === 1);
+    if (stationToUpdate) {
+        stationToUpdate.status = stationToUpdate.status === 'available' ? 'occupied' : 'available';
+        broadcastAvailability();
+    }
+}, 10000); // Every 10 seconds
+
+app.get('/api/stations', authenticateToken, (req, res) => {
+    // In a real scenario, you'd fetch from your DB or an external API
+    res.json(chargingStations);
+});
+
+// --- Reservations ---
+app.post('/api/reservations', authenticateToken, async (req, res) => {
+    try {
+        const { station_id, start_time, end_time } = req.body;
+        const userId = req.user.id;
+
+        // Basic validation and availability check (more complex logic needed)
+        const station = chargingStations.find(s => s.id === station_id && s.status === 'available');
+        if (!station) {
+            return res.status(400).json({ message: 'Station not available or invalid' });
+        }
+
+        // Placeholder for payment initiation (integrate with Stripe/Razorpay)
+        const total_cost = 0; // Calculate based on duration, power, price
+        const payment_status = 'unpaid';
+
+        const result = await pool.query(
+            'INSERT INTO reservations (user_id, station_id, start_time, end_time, total_cost, payment_status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+            [userId, station_id, start_time, end_time, total_cost, payment_status]
+        );
+
+        // Update station status locally and broadcast (in a real system, this would trigger from charging station itself)
+        station.status = 'reserved';
+        broadcastAvailability();
+
+        res.status(201).json({ message: 'Reservation created', reservation: result.rows[0] });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error creating reservation' });
+    }
+});
+
+// --- Payment Processing (Conceptual - integration with a payment gateway) ---
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY); // Example for Stripe
+
+app.post('/api/process-payment', authenticateToken, async (req, res) => {
+    try {
+        const { reservation_id, amount, payment_method_id } = req.body;
+        const userId = req.user.id;
+
+        // Verify reservation belongs to user and is unpaid
+        const reservationResult = await pool.query(
+            'SELECT * FROM reservations WHERE id = $1 AND user_id = $2 AND payment_status = $3',
+            [reservation_id, userId, 'unpaid']
+        );
+        const reservation = reservationResult.rows[0];
+
+        if (!reservation) {
+            return res.status(400).json({ message: 'Invalid or already paid reservation' });
+        }
+
+        // Create a payment intent with Stripe (or similar for other gateways)
+        const paymentIntent = await stripe.paymentIntents.create({
+            amount: Math.round(amount * 100), // Amount in cents
+            currency: 'inr',
+            payment_method: payment_method_id,
+            confirm: true,
+            return_url: 'http://localhost:3000/payment-success', // Your frontend success URL
+        });
+
+        // Update payment status in your DB
+        await pool.query(
+            'INSERT INTO payments (user_id, reservation_id, transaction_id, amount, status) VALUES ($1, $2, $3, $4, $5)',
+            [userId, reservation_id, paymentIntent.id, amount, paymentIntent.status === 'succeeded' ? 'successful' : 'pending']
+        );
+        await pool.query(
+            'UPDATE reservations SET payment_status = $1 WHERE id = $2',
+            [paymentIntent.status === 'succeeded' ? 'paid' : 'pending', reservation_id]
+        );
+
+        res.json({ clientSecret: paymentIntent.client_secret, status: paymentIntent.status });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error processing payment', details: err.raw ? err.raw.message : err.message });
+    }
+});
+
+// --- User Profile and Vehicle Details ---
+app.get('/api/users/me', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const userResult = await pool.query('SELECT id, username, email, first_name, last_name FROM users WHERE id = $1', [userId]);
+        const vehiclesResult = await pool.query('SELECT * FROM vehicles WHERE user_id = $1', [userId]);
+        const profilesResult = await pool.query('SELECT * FROM charging_profiles WHERE user_id = $1', [userId]);
+
+        res.json({
+            user: userResult.rows[0],
+            vehicles: vehiclesResult.rows,
+            charging_profile: profilesResult.rows[0]
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error fetching user profile' });
+    }
+});
+
+app.post('/api/vehicles', authenticateToken, async (req, res) => {
+    try {
+        const { make, model, year, connector_type, battery_capacity_kwh } = req.body;
+        const userId = req.user.id;
+        const result = await pool.query(
+            'INSERT INTO vehicles (user_id, make, model, year, connector_type, battery_capacity_kwh) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+            [userId, make, model, year, connector_type, battery_capacity_kwh]
+        );
+        res.status(201).json({ message: 'Vehicle added successfully', vehicle: result.rows[0] });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error adding vehicle' });
+    }
+});
+
+// Start the server
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
